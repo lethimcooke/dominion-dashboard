@@ -282,7 +282,7 @@ const WOTYPES = ["Upper","Lower","Push","Pull","Legs","Full Body","Run","Cardio"
 const defaults = () => ({
   daily: {}, habits: [],
   goals: [],
-  finance: { accounts: [], snapshots: [], budget: [], budgetMonth: todayISO().slice(0,7) },
+  finance: { accounts: [], snapshots: [], budget: [], budgetMonth: todayISO().slice(0,7), holdings: [], subs: [], finnhubKey: "" },
   fitness: { workouts: [], weights: [], templates: [] },
   dominion: { phases: [], notes: "" },
 });
@@ -385,14 +385,44 @@ async function loadAll() {
   }
   hydrate(Object.fromEntries(rows.map(r => [r.module, r.data])));
   rolloverBudget();
+  advanceSubs();
 }
 function rolloverBudget() {
   const m = todayISO().slice(0,7);
   if (D.finance.budgetMonth !== m) { D.finance.budget.forEach(b => b.spent = 0); D.finance.budgetMonth = m; save("finance"); }
 }
+function advanceSubs() {  // roll past renewal dates forward one cycle at a time
+  let changed = false; const t = todayISO();
+  (D.finance.subs||[]).forEach(s => {
+    while (s.next && s.next < t) {
+      const d = new Date(s.next+"T12:00");
+      if (s.cycle === "Yearly") d.setFullYear(d.getFullYear()+1); else d.setMonth(d.getMonth()+1);
+      s.next = iso(d); changed = true;
+    }
+  });
+  if (changed) save("finance");
+}
+async function refreshQuotes() {
+  const F = D.finance;
+  if (!F.finnhubKey || !F.holdings.length) return;
+  const st = $("#qstatus"); if (st) st.textContent = "FETCHING QUOTES…";
+  let ok = 0, fail = 0;
+  for (const h of F.holdings) {
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(h.ticker)}&token=${encodeURIComponent(F.finnhubKey)}`);
+      const j = await r.json();
+      if (j && +j.c > 0) { h.price = +j.c; h.prev = +j.pc || 0; h.updated = todayISO(); ok++; } else fail++;
+    } catch { fail++; }
+  }
+  save("finance"); render();
+  const st2 = $("#qstatus");
+  if (st2 && fail) st2.textContent = `${ok} UPDATED · ${fail} FAILED (CHECK TICKER OR KEY)`;
+}
 
 /* ---------------- derived ---------------- */
-const netWorth = () => D.finance.accounts.reduce((s,a)=>s+(+a.value||0),0);
+const holdingsTotal = () => (D.finance.holdings||[]).reduce((s,h)=>s+(+h.shares||0)*(+h.price||0),0);
+const netWorth = () => D.finance.accounts.reduce((s,a)=>s+(+a.value||0),0) + holdingsTotal();
+const subsMonthly = () => (D.finance.subs||[]).reduce((s,x)=>s+(x.cycle==="Yearly"?(+x.amt||0)/12:(+x.amt||0)),0);
 const todayGoals = () => (D.daily[todayISO()] ||= []);
 const weekWorkouts = () => {
   const now = new Date(); const start = new Date(now); start.setDate(now.getDate() - ((now.getDay()+6)%7)); start.setHours(0,0,0,0);
@@ -551,6 +581,7 @@ function vFinance() {
   const delta = prev!==null ? nw-prev : null;
   const byType = {};
   F.accounts.forEach(a=>{ const val = +a.value||0; if (val > 0) byType[a.type]=(byType[a.type]||0)+val; });
+  const htot = holdingsTotal(); if (htot > 0) byType["Stocks"] = (byType["Stocks"]||0) + htot;
   const alloc = Object.entries(byType).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
   const monthName = new Date(F.budgetMonth+"-15").toLocaleDateString("en-US",{month:"long", year:"numeric"});
   const lastSnap = snaps.length ? snaps[snaps.length-1].date : null;
@@ -599,6 +630,50 @@ function vFinance() {
       <form class="addrow" data-a="add-budget">
         <input class="grow" name="cat" placeholder="Category" required>
         <input type="number" step="any" name="plan" placeholder="Monthly budget" required><button class="btn">Add</button>
+      </form>
+    </div>
+    <div class="card corners c6">
+      <h3>Portfolio ${F.finnhubKey && F.holdings.length ? `<button class="ghost small act" data-a="quotes">↻ Refresh prices</button>` : ""}</h3>
+      ${F.holdings.length ? F.holdings.map(hd => { const val = (+hd.shares||0)*(+hd.price||0);
+        const chg = hd.prev ? (hd.price-hd.prev)/hd.prev*100 : null; return `
+      <div class="acct rowhover">
+        <b class="num" style="min-width:52px">${esc(hd.ticker)}</b>
+        <input class="val num" type="number" step="any" value="${+hd.shares||0}" data-a="hold-field" data-f="shares" data-id="${hd.id}" aria-label="shares of ${esc(hd.ticker)}" style="width:70px;flex:0 0 70px;text-align:right" title="shares">
+        <span class="meta">sh ×</span>
+        <input class="val num" type="number" step="any" value="${+hd.price||0}" data-a="hold-field" data-f="price" data-id="${hd.id}" aria-label="price of ${esc(hd.ticker)}" style="width:80px;flex:0 0 80px;text-align:right" title="price">
+        <span class="num" style="margin-left:auto">${fmt$(val)}</span>
+        ${chg!==null?`<span class="meta ${chg>=0?"up":"down"}">${chg>=0?"▲":"▼"}${Math.abs(chg).toFixed(1)}%</span>`:""}
+        <button class="del" data-a="del-hold" data-id="${hd.id}" aria-label="delete">×</button>
+      </div>`; }).join("") + `
+      <div class="meta" id="qstatus" style="margin-top:8px">TOTAL ${fmt$(holdingsTotal())}${F.holdings.some(h=>h.updated)?` · PRICES AS OF ${fmtDate(F.holdings.filter(h=>h.updated).sort((a,b)=>a.updated.localeCompare(b.updated))[0].updated).toUpperCase()}`:""} · COUNTED IN NET WORTH</div>`
+      : `<div class="empty">Add tickers you own. Don't also count them inside an account, or they'll be doubled.</div>`}
+      <form class="addrow" data-a="add-hold">
+        <input name="ticker" placeholder="Ticker (VOO)" required style="width:110px;text-transform:uppercase">
+        <input type="number" step="any" name="shares" placeholder="Shares" required>
+        <input type="number" step="any" name="price" placeholder="Price (opt.)">
+        <button class="btn">Add</button>
+      </form>
+      ${!F.finnhubKey ? `<form class="addrow" data-a="fin-key">
+        <input class="grow" name="key" placeholder="Paste free finnhub.io API key for live prices" required>
+        <button class="ghost small">Enable live prices</button></form>
+        <div class="meta" style="margin-top:6px;white-space:normal">FREE KEY AT FINNHUB.IO/REGISTER · STORED IN YOUR DATABASE, BEHIND YOUR LOGIN</div>` : ""}
+    </div>
+    <div class="card corners c6">
+      <h3>Subscriptions <span class="meta act">${fmt$(subsMonthly())}/MO${F.subs.some(s=>s.cycle==="Yearly")?" AVG":""}</span></h3>
+      ${F.subs.length ? [...F.subs].sort((a,b)=>(a.next||"9999").localeCompare(b.next||"9999")).map(s => {
+        const days = s.next ? Math.ceil((new Date(s.next+"T12:00") - new Date(todayISO()+"T12:00"))/864e5) : null; return `
+      <div class="acct rowhover">
+        <span class="txt">${esc(s.name)} <span class="typechip">${s.cycle==="Yearly"?"YR":"MO"}</span></span>
+        ${days!==null?`<span class="meta" style="${days<=7?"color:var(--warn)":""}">${days===0?"RENEWS TODAY":`RENEWS ${fmtDate(s.next).toUpperCase()} (${days}D)`}</span>`:""}
+        <span class="num">${fmt$(+s.amt||0)}</span>
+        <button class="del" data-a="del-sub" data-id="${s.id}" aria-label="delete">×</button>
+      </div>`; }).join("") : `<div class="empty">Track what renews and when. Renewal dates roll forward on their own.</div>`}
+      <form class="addrow" data-a="add-sub">
+        <input class="grow" name="name" placeholder="Subscription (Canva)" required>
+        <input type="number" step="any" name="amt" placeholder="Cost" required>
+        <select name="cycle" aria-label="billing cycle"><option>Monthly</option><option>Yearly</option></select>
+        <input type="date" name="next" aria-label="next renewal" required>
+        <button class="btn">Add</button>
       </form>
     </div>
   </div>`;
@@ -855,6 +930,9 @@ document.addEventListener("click", e => {
       D.finance.snapshots.push({date:k, total:netWorth()}); D.finance.snapshots.sort((a,b)=>a.date.localeCompare(b.date)); return "finance"; },
     "del-acct": () => { D.finance.accounts = D.finance.accounts.filter(x=>x.id!==id); return "finance"; },
     "del-budget": () => { D.finance.budget = D.finance.budget.filter(x=>x.id!==id); return "finance"; },
+    "del-hold": () => { D.finance.holdings = D.finance.holdings.filter(x=>x.id!==id); return "finance"; },
+    "del-sub": () => { D.finance.subs = D.finance.subs.filter(x=>x.id!==id); return "finance"; },
+    quotes: () => { refreshQuotes(); return "skip"; },
     /* gym */
     "cal-nav": () => { calBase.setMonth(calBase.getMonth() + +id); return "nosave"; },
     "cal-day": () => { selDay = id; editingWO = null; return "nosave"; },
@@ -914,6 +992,10 @@ document.addEventListener("submit", async e => {
     "add-goal": () => { D.goals.push({id:uid(), title:v("title"), due:v("due")||"", pct:0}); return "goals"; },
     "add-acct": () => { D.finance.accounts.push({id:uid(), name:v("name"), type:v("type"), value:+v("value")||0}); return "finance"; },
     "add-budget": () => { D.finance.budget.push({id:uid(), cat:v("cat"), plan:+v("plan")||0, spent:0}); return "finance"; },
+    "add-hold": () => { D.finance.holdings.push({id:uid(), ticker:v("ticker").toUpperCase(), shares:+v("shares")||0, price:+v("price")||0, prev:0, updated:""});
+      if (D.finance.finnhubKey) setTimeout(refreshQuotes, 50); return "finance"; },
+    "add-sub": () => { D.finance.subs.push({id:uid(), name:v("name"), amt:+v("amt")||0, cycle:v("cycle"), next:v("next")||""}); return "finance"; },
+    "fin-key": () => { D.finance.finnhubKey = v("key"); setTimeout(refreshQuotes, 50); return "finance"; },
     spend: () => { const b = D.finance.budget.find(b=>b.id===f.dataset.id); b.spent += +v("amt")||0; return "finance"; },
     "add-weight": () => { const k = v("date")||todayISO();
       D.fitness.weights = D.fitness.weights.filter(w=>w.date!==k);
@@ -945,6 +1027,8 @@ document.addEventListener("change", e => {
   const el = e.target;
   if (el.dataset.a === "acct-val") { const a = D.finance.accounts.find(a=>a.id===el.dataset.id);
     a.value = +el.value||0; save("finance"); render(); }
+  if (el.dataset.a === "hold-field") { const hd = D.finance.holdings.find(h=>h.id===el.dataset.id);
+    hd[el.dataset.f] = +el.value||0; save("finance"); render(); }
   if (el.dataset.a === "pct-goal") render();
   if (el.dataset.a === "pr-ex") { prEx = el.value; render(); }
   if (el.dataset.a === "wo-field") {
@@ -994,6 +1078,8 @@ if (new URLSearchParams(location.search).has("test")) {
   window.__TEST__ = true;
   session = {user:{id:"test", email:"aiden@test"}};
   hydrate(seedData());
+  D.finance.holdings.push({id:uid(), ticker:"VOO", shares:2, price:520, prev:515, updated:todayISO()});
+  D.finance.subs.push({id:uid(), name:"Canva", amt:19.94, cycle:"Monthly", next:iso(new Date(Date.now()+3*864e5))});
   render();
 }
 </script>
