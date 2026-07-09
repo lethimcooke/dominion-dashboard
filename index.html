@@ -367,6 +367,7 @@ async function loadAll() {
     return;
   }
   hydrate(Object.fromEntries(rows.map(r => [r.module, r.data])));
+  applyJul9Setup();
   rolloverBudget();
   advanceSubs();
 }
@@ -379,32 +380,59 @@ function advanceSubs() {  // roll past renewal dates forward one cycle at a time
   (D.finance.subs||[]).forEach(s => {
     while (s.next && s.next < t) {
       const d = new Date(s.next+"T12:00");
-      if (s.cycle === "Yearly") d.setFullYear(d.getFullYear()+1); else d.setMonth(d.getMonth()+1);
+      if (s.cycle === "Yearly") d.setFullYear(d.getFullYear()+1);
+      else {  // keep the billing day-of-month; dom 31 means "last day of the month"
+        const dom = s.dom || d.getDate();
+        d.setDate(1); d.setMonth(d.getMonth()+1);
+        d.setDate(Math.min(dom, new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()));
+      }
       s.next = iso(d); changed = true;
     }
   });
   if (changed) save("finance");
 }
+/* one-time setup (2026-07-09): portfolio, subscriptions, live-price key */
+function applyJul9Setup() {
+  const F = D.finance;
+  if (F.setup20260709) return;
+  F.setup20260709 = true;
+  F.finnhubKey = F.finnhubKey || "d97ucrpr01qng2npm8c0d97ucrpr01qng2npm8cg";
+  F.holdings = [
+    {id:uid(), ticker:"BTC",   shares:0.09466, price:63382.3, prev:0, updated:todayISO()},
+    {id:uid(), ticker:"VTSAX", shares:1, price:479.96, prev:0, updated:"", manual:true},
+    {id:uid(), ticker:"BTMPX", shares:1, price:119.26, prev:0, updated:"", manual:true},
+  ];
+  F.subs = [
+    {id:uid(), name:"Claude Pro",       amt:20,    cycle:"Monthly", next:"2026-07-31", dom:31},
+    {id:uid(), name:"Google Workspace", amt:10,    cycle:"Monthly", next:"2026-08-01", dom:1},
+    {id:uid(), name:"Spotify",          amt:12.99, cycle:"Monthly", next:"2026-07-12", dom:12},
+    {id:uid(), name:"CapCut Pro",       amt:20,    cycle:"Monthly", next:"2026-08-07", dom:7},
+    {id:uid(), name:"Amazon Prime",     amt:15,    cycle:"Monthly", next:"2026-07-12", dom:12},
+  ];
+  save("finance");
+}
 async function refreshQuotes() {
   const F = D.finance;
   if (!F.finnhubKey || !F.holdings.length) return;
-  const st = $("#qstatus"); if (st) st.textContent = "FETCHING QUOTES…";
+  const st = $("#qstatus"); if (st) st.textContent = "Fetching quotes…";
   let ok = 0, fail = 0;
   for (const h of F.holdings) {
+    if (h.manual) continue;  // mutual funds etc. finnhub free tier can't quote; value edited by hand
+    const sym = h.ticker === "BTC" ? "BINANCE:BTCUSDT" : h.ticker;
     try {
-      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(h.ticker)}&token=${encodeURIComponent(F.finnhubKey)}`);
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${encodeURIComponent(F.finnhubKey)}`);
       const j = await r.json();
       if (j && +j.c > 0) { h.price = +j.c; h.prev = +j.pc || 0; h.updated = todayISO(); ok++; } else fail++;
     } catch { fail++; }
   }
   save("finance"); render();
   const st2 = $("#qstatus");
-  if (st2 && fail) st2.textContent = `${ok} UPDATED · ${fail} FAILED (CHECK TICKER OR KEY)`;
+  if (st2 && fail) st2.textContent = `${ok} updated · ${fail} failed (check ticker or key)`;
 }
 
 /* ---------------- derived ---------------- */
 const holdingsTotal = () => (D.finance.holdings||[]).reduce((s,h)=>s+(+h.shares||0)*(+h.price||0),0);
-const netWorth = () => D.finance.accounts.reduce((s,a)=>s+(+a.value||0),0) + holdingsTotal();
+const netWorth = () => holdingsTotal();
 const subsMonthly = () => (D.finance.subs||[]).reduce((s,x)=>s+(x.cycle==="Yearly"?(+x.amt||0)/12:(+x.amt||0)),0);
 const todayGoals = () => (D.daily[todayISO()] ||= []);
 const weekWorkouts = () => {
@@ -502,12 +530,12 @@ function vToday() {
   const yk = iso(y);
   const carry = (D.daily[yk]||[]).filter(t=>!t.done).length;
   return `
-  <div class="pagehead"><h2>Today</h2><span class="sub">${new Date().toLocaleDateString("en-US",{weekday:"long", month:"long", day:"numeric"}).toUpperCase()}</span></div>
+  <div class="pagehead"><h2>Welcome, Aiden</h2><span class="sub">${new Date().toLocaleDateString("en-US",{weekday:"long", month:"long", day:"numeric"}).toUpperCase()}</span></div>
   <div class="grid">
     <div class="stats">
       <div class="stat"><div class="lbl">Net worth</div><div class="val">${fmt$(netWorth())}</div><div class="hint">${(()=>{const s=D.finance.snapshots; if(!s.length) return "update balances";
         const age=Math.floor((new Date(todayISO()+"T12:00")-new Date(s[s.length-1].date+"T12:00"))/864e5);
-        return age>=7?`⚠ balances ${age}d old`:`${D.finance.accounts.length} accounts`;})()}</div></div>
+        return age>=7?`⚠ balances ${age}d old`:`${D.finance.holdings.length} holdings`;})()}</div></div>
       <div class="stat"><div class="lbl">Daily goals</div><div class="val">${done}/${g.length||0}</div><div class="hint">${g.length? (done===g.length?"all clear":"in progress") : "none planned"}</div></div>
       <div class="stat"><div class="lbl">Habits</div><div class="val">${habitsDone}/${D.habits.length}</div><div class="hint">checked today</div></div>
       <div class="stat"><div class="lbl">Workouts</div><div class="val">${weekWorkouts()}</div><div class="hint">this week</div></div>
@@ -562,10 +590,7 @@ function vFinance() {
   const snaps = F.snapshots;
   const prev = snaps.length>1 ? snaps[snaps.length-2].total : null;
   const delta = prev!==null ? nw-prev : null;
-  const byType = {};
-  F.accounts.forEach(a=>{ const val = +a.value||0; if (val > 0) byType[a.type]=(byType[a.type]||0)+val; });
-  const htot = holdingsTotal(); if (htot > 0) byType["Stocks"] = (byType["Stocks"]||0) + htot;
-  const alloc = Object.entries(byType).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
+  const alloc = (F.holdings||[]).map(h=>({name:h.ticker, value:(+h.shares||0)*(+h.price||0)})).filter(x=>x.value>0).sort((a,b)=>b.value-a.value);
   const monthName = new Date(F.budgetMonth+"-15").toLocaleDateString("en-US",{month:"long", year:"numeric"});
   const lastSnap = snaps.length ? snaps[snaps.length-1].date : null;
   const snapAge = lastSnap ? Math.floor((new Date(todayISO()+"T12:00") - new Date(lastSnap+"T12:00"))/864e5) : null;
@@ -577,26 +602,12 @@ function vFinance() {
       <h3>Net worth <button class="btn small act" data-a="snap">Save snapshot</button></h3>
       <div class="big">${fmt$(nw)}</div>
       ${delta!==null?`<div class="meta" style="margin-top:2px"><span class="${delta>=0?"up":"down"} num">${delta>=0?"▲":"▼"} ${fmt$(Math.abs(delta))}</span> since last snapshot</div>`:`<div class="meta">Save a snapshot each week to build the trend.</div>`}
-      ${stale?`<div class="meta" style="margin-top:6px;color:var(--warn)">⚠ ${snapAge===null?"NO SNAPSHOT YET":`BALANCES ${snapAge}D OLD`} — UPDATE ACCOUNTS, THEN SAVE SNAPSHOT</div>`:""}
+      ${stale?`<div class="meta" style="margin-top:6px;color:var(--warn)">${snapAge===null?"No snapshot yet":`Balances ${snapAge}d old`} — refresh prices, then save a snapshot</div>`:""}
       ${lineChart(snaps.map(s=>({x:s.date,y:s.total})),{money:true, target:{v:15000,label:"TARGET $15K"}})}
     </div>
     <div class="card corners c4">
       <h3>Allocation</h3>
       ${donut(alloc)}
-    </div>
-    <div class="card corners c6">
-      <h3>Accounts</h3>
-      ${F.accounts.map(a=>`<div class="acct rowhover">
-        <span class="dot" style="background:var(--c${(["Cash","Stocks","Crypto"].indexOf(a.type)+4)%4+1})"></span>
-        <span class="txt">${esc(a.name)} <span class="meta">${esc(a.type)}</span></span>
-        <input class="val num" type="number" step="any" value="${+a.value||0}" data-a="acct-val" data-id="${a.id}" aria-label="value of ${esc(a.name)}" style="${(+a.value||0)<0?"color:var(--bad)":""}">
-        <button class="del" data-a="del-acct" data-id="${a.id}" aria-label="delete">×</button>
-      </div>`).join("") || `<div class="empty">Add your bank, brokerage, and wallets.</div>`}
-      <form class="addrow" data-a="add-acct">
-        <input class="grow" name="name" placeholder="Account name" required>
-        <select name="type" aria-label="type"><option>Cash</option><option>Stocks</option><option>Crypto</option><option>Debt</option><option>Other</option></select>
-        <input type="number" step="any" name="value" placeholder="Value" required><button class="btn">Add</button>
-      </form>
     </div>
     <div class="card corners c6">
       <h3>Budget · ${monthName} <span class="meta act">resets monthly</span></h3>
@@ -621,15 +632,18 @@ function vFinance() {
         const chg = hd.prev ? (hd.price-hd.prev)/hd.prev*100 : null; return `
       <div class="acct rowhover">
         <b class="num" style="min-width:52px">${esc(hd.ticker)}</b>
-        <input class="val num" type="number" step="any" value="${+hd.shares||0}" data-a="hold-field" data-f="shares" data-id="${hd.id}" aria-label="shares of ${esc(hd.ticker)}" style="width:70px;flex:0 0 70px;text-align:right" title="shares">
+        ${hd.manual
+          ? `<span class="meta">manual value</span>
+             <input class="val num" type="number" step="any" value="${+hd.price||0}" data-a="hold-field" data-f="price" data-id="${hd.id}" aria-label="value of ${esc(hd.ticker)}" style="width:100px;flex:0 0 100px;text-align:right;margin-left:auto" title="value">`
+          : `<input class="val num" type="number" step="any" value="${+hd.shares||0}" data-a="hold-field" data-f="shares" data-id="${hd.id}" aria-label="shares of ${esc(hd.ticker)}" style="width:70px;flex:0 0 70px;text-align:right" title="shares">
         <span class="meta">sh ×</span>
         <input class="val num" type="number" step="any" value="${+hd.price||0}" data-a="hold-field" data-f="price" data-id="${hd.id}" aria-label="price of ${esc(hd.ticker)}" style="width:80px;flex:0 0 80px;text-align:right" title="price">
         <span class="num" style="margin-left:auto">${fmt$(val)}</span>
-        ${chg!==null?`<span class="meta ${chg>=0?"up":"down"}">${chg>=0?"▲":"▼"}${Math.abs(chg).toFixed(1)}%</span>`:""}
+        ${chg!==null?`<span class="meta ${chg>=0?"up":"down"}">${chg>=0?"▲":"▼"}${Math.abs(chg).toFixed(1)}%</span>`:""}`}
         <button class="del" data-a="del-hold" data-id="${hd.id}" aria-label="delete">×</button>
       </div>`; }).join("") + `
-      <div class="meta" id="qstatus" style="margin-top:8px">TOTAL ${fmt$(holdingsTotal())}${F.holdings.some(h=>h.updated)?` · PRICES AS OF ${fmtDate(F.holdings.filter(h=>h.updated).sort((a,b)=>a.updated.localeCompare(b.updated))[0].updated).toUpperCase()}`:""} · COUNTED IN NET WORTH</div>`
-      : `<div class="empty">Add tickers you own. Don't also count them inside an account, or they'll be doubled.</div>`}
+      <div class="meta" id="qstatus" style="margin-top:8px">Total ${fmt$(holdingsTotal())}${F.holdings.some(h=>h.updated)?` · prices as of ${fmtDate(F.holdings.filter(h=>h.updated).sort((a,b)=>a.updated.localeCompare(b.updated))[0].updated)}`:""} · counted in net worth</div>`
+      : `<div class="empty">Add tickers you own. Use BTC for live bitcoin pricing.</div>`}
       <form class="addrow" data-a="add-hold">
         <input name="ticker" placeholder="Ticker (VOO)" required style="width:110px;text-transform:uppercase">
         <input type="number" step="any" name="shares" placeholder="Shares" required>
@@ -647,7 +661,7 @@ function vFinance() {
         const days = s.next ? Math.ceil((new Date(s.next+"T12:00") - new Date(todayISO()+"T12:00"))/864e5) : null; return `
       <div class="acct rowhover">
         <span class="txt">${esc(s.name)} <span class="typechip">${s.cycle==="Yearly"?"YR":"MO"}</span></span>
-        ${days!==null?`<span class="meta" style="${days<=7?"color:var(--warn)":""}">${days===0?"RENEWS TODAY":`RENEWS ${fmtDate(s.next).toUpperCase()} (${days}D)`}</span>`:""}
+        ${days!==null?`<span class="meta" style="${days<=7?"color:var(--warn)":""}">${days===0?"renews today":`renews ${fmtDate(s.next)} (${days}d)`}</span>`:""}
         <span class="num">${fmt$(+s.amt||0)}</span>
         <button class="del" data-a="del-sub" data-id="${s.id}" aria-label="delete">×</button>
       </div>`; }).join("") : `<div class="empty">Track what renews and when. Renewal dates roll forward on their own.</div>`}
@@ -785,7 +799,10 @@ function vGym() {
       ${F.templates.length?F.templates.map(t=>`
         <div class="goal rowhover"><div class="top"><b>${esc(t.name)}</b>
           <button class="del" data-a="del-tpl" data-id="${t.id}" aria-label="delete">×</button></div>
-          <div class="chips" style="margin-top:5px">${t.exs.map(e=>`<span class="chip">${esc(e)}</span>`).join("")}</div>
+          <div class="chips" style="margin-top:5px">${t.exs.map((e,i)=>`<span class="chip">${esc(e)}<button class="del" data-a="tpl-del-ex" data-id="${t.id}" data-i="${i}" aria-label="remove ${esc(e)}" style="font-size:12px;padding:0 0 0 4px">×</button></span>`).join("")}</div>
+          <form class="addrow" data-a="tpl-add-ex" data-id="${t.id}" style="margin-top:8px">
+            <input class="grow" name="ex" placeholder="Add exercise to ${esc(t.name)}" list="exlist" required>
+            <button class="ghost small">Add</button></form>
         </div>`).join(""):`<div class="empty">Save your routines, e.g. "Push Day".</div>`}
       <form class="addrow" data-a="add-tpl" style="flex-direction:column;align-items:stretch">
         <input name="name" placeholder="Template name (Push Day)" required>
@@ -935,6 +952,7 @@ document.addEventListener("click", e => {
     "del-set": () => { const w = D.fitness.workouts.find(w=>w.id===el.dataset.w);
       const en = w.entries.find(en=>en.id===el.dataset.e); en.sets.splice(+id,1); return "fitness"; },
     "del-tpl": () => { D.fitness.templates = D.fitness.templates.filter(t=>t.id!==id); return "fitness"; },
+    "tpl-del-ex": () => { const t = D.fitness.templates.find(t=>t.id===id); t.exs.splice(+el.dataset.i,1); return "fitness"; },
     "cycle-phase": () => { const p = D.dominion.phases.find(p=>p.id===id);
       p.status = {planned:"active", active:"done", done:"planned"}[p.status]; return "dominion"; },
     "del-phase": () => { if (!confirm("Delete this phase and its tasks?")) return "skip";
@@ -977,7 +995,8 @@ document.addEventListener("submit", async e => {
     "add-budget": () => { D.finance.budget.push({id:uid(), cat:v("cat"), plan:+v("plan")||0, spent:0}); return "finance"; },
     "add-hold": () => { D.finance.holdings.push({id:uid(), ticker:v("ticker").toUpperCase(), shares:+v("shares")||0, price:+v("price")||0, prev:0, updated:""});
       if (D.finance.finnhubKey) setTimeout(refreshQuotes, 50); return "finance"; },
-    "add-sub": () => { D.finance.subs.push({id:uid(), name:v("name"), amt:+v("amt")||0, cycle:v("cycle"), next:v("next")||""}); return "finance"; },
+    "add-sub": () => { const next = v("next")||"";
+      D.finance.subs.push({id:uid(), name:v("name"), amt:+v("amt")||0, cycle:v("cycle"), next, dom:+next.slice(8,10)||0}); return "finance"; },
     "fin-key": () => { D.finance.finnhubKey = v("key"); setTimeout(refreshQuotes, 50); return "finance"; },
     spend: () => { const b = D.finance.budget.find(b=>b.id===f.dataset.id); b.spent += +v("amt")||0; return "finance"; },
     "add-weight": () => { const k = v("date")||todayISO();
@@ -990,6 +1009,7 @@ document.addEventListener("submit", async e => {
       en.sets.push({w:+v("w")||0, r:+v("r")||0}); return "fitness"; },
     "add-tpl": () => { D.fitness.templates.push({id:uid(), name:v("name"),
       exs:v("exs").split(",").map(s=>s.trim()).filter(Boolean)}); return "fitness"; },
+    "tpl-add-ex": () => { D.fitness.templates.find(t=>t.id===f.dataset.id).exs.push(v("ex")); return "fitness"; },
     "add-task": () => { D.dominion.phases.find(p=>p.id===f.dataset.p).tasks.push({id:uid(), text:v("text"), done:false}); return "dominion"; },
     "add-phase": () => { D.dominion.phases.push({id:uid(), name:v("name"), status:"planned", tasks:[]}); return "dominion"; },
   };
@@ -1061,8 +1081,7 @@ if (new URLSearchParams(location.search).has("test")) {
   window.__TEST__ = true;
   session = {user:{id:"test", email:"aiden@test"}};
   hydrate(seedData());
-  D.finance.holdings.push({id:uid(), ticker:"VOO", shares:2, price:520, prev:515, updated:todayISO()});
-  D.finance.subs.push({id:uid(), name:"Canva", amt:19.94, cycle:"Monthly", next:iso(new Date(Date.now()+3*864e5))});
+  applyJul9Setup();
   render();
 }
 </script>
